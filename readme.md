@@ -366,4 +366,4 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-You can also create a separate file called `LICENSE` containing the same MIT License text.
+
