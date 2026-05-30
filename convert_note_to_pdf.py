@@ -489,6 +489,70 @@ def _extract_recogntext(note_path: str, page_count: int) -> list:
     return text_layers
 
 
+
+def extract_recogntext_with_positions(note_path: str, page_count: int) -> list:
+    """
+    Extract RECOGNTEXT words with canvas-coordinate bounding boxes.
+    Returns list (by page) of word dicts with keys label/x/y/w/h
+    in Supernote canvas units (1404 x 1872).
+    """
+    SCALE = 12.1
+    import json as _json, base64 as _b64
+    pages = [[] for _ in range(page_count)]
+    try:
+        f = open(note_path, 'rb')
+        f.seek(0, 2); file_size = f.tell()
+        last_chunk, _ = _get_last_chunk(f, file_size)
+
+        def read_int(pos, n=4):
+            d = _read_chunk(f, pos, n)
+            return int.from_bytes(d, 'little') if len(d) >= n else 0
+
+        for page_idx in range(page_count):
+            m = re.search(rb'<PAGE' + str(page_idx + 1).encode() + rb':(\d+)>', last_chunk)
+            if not m:
+                break
+            page_meta = _read_chunk(f, int(m.group(1)), 3000)
+            rt_m = re.search(rb'<RECOGNTEXT:(\d+)>', page_meta)
+            if not rt_m:
+                continue
+            rt_addr = int(rt_m.group(1))
+            rt_size = read_int(rt_addr)
+            if not 0 < rt_size < 500_000:
+                continue
+            b64_data = _read_chunk(f, rt_addr + 4, rt_size)
+            try:
+                obj = _json.loads(_b64.b64decode(b64_data).decode('utf-8'))
+                words = []
+                def _collect(node):
+                    if isinstance(node, dict):
+                        if node.get('type') == 'Text' and 'words' in node:
+                            for w in node['words']:
+                                bb = w.get('bounding-box', {})
+                                label = w.get('label', '')
+                                if label.strip() and label not in (' ', '\n'):
+                                    words.append({
+                                        'label': label,
+                                        'x': bb.get('x', 0) * SCALE,
+                                        'y': bb.get('y', 0) * SCALE,
+                                        'w': bb.get('width', 50) * SCALE,
+                                        'h': bb.get('height', 20) * SCALE,
+                                    })
+                        for v in node.values():
+                            _collect(v)
+                    elif isinstance(node, list):
+                        for v in node:
+                            _collect(v)
+                _collect(obj)
+                if words:
+                    pages[page_idx] = words
+            except Exception:
+                pass
+        f.close()
+    except Exception as e:
+        print(f'\n  Warning: positioned RECOGNTEXT extraction failed ({e})')
+    return pages
+
 def extract_external_links(note_path: str, page_count: int) -> dict:
     """
     Extract EXTERNALLINKINFO tap targets from each page.
@@ -632,38 +696,45 @@ def inject_pdf_links(writer, note_links: dict, page_count: int,
 
 # ── Text overlay / PDF helpers ────────────────────────────────────────────────
 
-def build_text_overlay_pdf(text: str, page_width: float, page_height: float) -> bytes:
-    from reportlab.pdfgen import canvas
+def build_text_overlay_pdf(text_or_words, page_width: float, page_height: float,
+                            canvas_w: int = 1404, canvas_h: int = 1872) -> bytes:
+    """Invisible text overlay. text_or_words is a plain string (evenly distributed)
+    or a list of word dicts with label/x/y/w/h in canvas coords for exact alignment."""
+    from reportlab.pdfgen import canvas as rl_canvas
 
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=(page_width, page_height))
+    c = rl_canvas.Canvas(buf, pagesize=(page_width, page_height))
     c.setFillAlpha(0)
-    c.setFont("Helvetica", 12)
 
-    words = text.split()
-    if not words:
-        c.save()
-        return buf.getvalue()
-
-    max_chars_per_line = max(1, int(page_width / 7))
-    lines = []
-    current = []
-    for word in words:
-        current.append(word)
-        if len(" ".join(current)) > max_chars_per_line:
-            lines.append(" ".join(current[:-1]))
-            current = [word]
-    if current:
-        lines.append(" ".join(current))
-
-    if not lines:
-        c.save()
-        return buf.getvalue()
-
-    line_height = page_height / max(len(lines), 1)
-    for i, line in enumerate(lines):
-        y = page_height - (i + 0.5) * line_height
-        c.drawString(10, y, line)
+    if isinstance(text_or_words, list) and text_or_words:
+        sx = page_width  / canvas_w
+        sy = page_height / canvas_h
+        for w in text_or_words:
+            word_h_pt = max(4.0, w['h'] * sy)
+            c.setFont('Helvetica', word_h_pt)
+            pdf_x = w['x'] * sx
+            pdf_y = page_height - (w['y'] + w['h']) * sy
+            c.drawString(pdf_x, pdf_y, w['label'])
+    else:
+        text = text_or_words if isinstance(text_or_words, str) else ''
+        words = text.split()
+        if words:
+            c.setFont('Helvetica', 12)
+            max_chars_per_line = max(1, int(page_width / 7))
+            lines = []
+            current = []
+            for word in words:
+                current.append(word)
+                if len(' '.join(current)) > max_chars_per_line:
+                    lines.append(' '.join(current[:-1]))
+                    current = [word]
+            if current:
+                lines.append(' '.join(current))
+            if lines:
+                line_height = page_height / max(len(lines), 1)
+                for i, line in enumerate(lines):
+                    y = page_height - (i + 0.5) * line_height
+                    c.drawString(10, y, line)
 
     c.save()
     return buf.getvalue()
@@ -679,7 +750,7 @@ def build_pdf_with_toc(pdf_bytes: bytes, text_layers: list,
     overlays = {}
     for i, page in enumerate(reader.pages):
         page_text = text_layers[i] if i < len(text_layers) else ""
-        if page_text and page_text.strip():
+        if page_text and (isinstance(page_text, list) or page_text.strip()):
             try:
                 width  = float(page.mediabox.width)
                 height = float(page.mediabox.height)
@@ -916,7 +987,19 @@ def convert_note_to_pdf(note_path: str, max_workers: int = 4,
         print("[3/3] Embedding text & bookmarks...", end='', flush=True)
         if pages_with_text or headings:
             try:
-                pdf_bytes = build_pdf_with_toc(pdf_bytes, text_layers, headings, keywords)
+                # Use positioned word layers so copy-paste aligns with visible ink
+                positioned_layers = extract_recogntext_with_positions(note_path, page_count)
+                merged_layers = []
+                for _i in range(page_count):
+                    if _i < len(positioned_layers) and positioned_layers[_i]:
+                        _layer = list(positioned_layers[_i])
+                        _tb = text_layers[_i] if _i < len(text_layers) else ''
+                        if _tb.strip():
+                            _layer.append({'label': _tb, 'x': 10, 'y': 10, 'w': 200, 'h': 14})
+                        merged_layers.append(_layer)
+                    else:
+                        merged_layers.append(text_layers[_i] if _i < len(text_layers) else '')
+                pdf_bytes = build_pdf_with_toc(pdf_bytes, merged_layers, headings, keywords)
                 n_toc = sum(len(v) for v in headings.values())
                 print(f"\n  Bookmarks: {n_toc} heading(s) added to PDF outline", flush=True)
             except ImportError as e:
